@@ -1,0 +1,106 @@
+# =============================================================================
+# Appian Operations Center — Complete Python Requirements
+# =============================================================================
+# Covers: Phase 1 (Kafka Pipeline) + Phase 2 (ML + 12 Advanced DL Modules)
+#         + Phase 3 (Monte Carlo Simulation) + Phase 4 (RL Agent)
+#         + Phase 5 (FastAPI + Dashboard)
+#
+# Install ALL at once:
+#   pip install -r requirements.txt
+#
+# NOTE: torch CPU-only is installed by default below.
+# =============================================================================
+
+# ── Core Data Science ──────────────────────────────────────────────────────────
+numpy
+pandas
+scipy
+scikit-learn
+statsmodels
+
+# ── Deep Learning (PyTorch CPU) ────────────────────────────────────────────────
+torch
+torchvision
+torchinfo
+
+# ── Gradient Boosting ──────────────────────────────────────────────────────────
+xgboost
+lightgbm
+
+# ── Model Explainability ───────────────────────────────────────────────────────
+shap
+
+# ── Reinforcement Learning (Phase 4) ──────────────────────────────────────────
+stable-baselines3
+gymnasium
+shimmy
+
+# ── Discrete Event Simulation (Phase 3) ───────────────────────────────────────
+simpy
+
+# ── Kafka Streaming (Phase 1 — requires Docker) ────────────────────────────────
+confluent-kafka
+kafka-python
+
+# ── Database & Caching (Phase 1 — requires Docker) ────────────────────────────
+redis
+psycopg2-binary
+sqlalchemy
+alembic
+
+# ── API Framework (Phase 5) ────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+websockets
+httpx
+python-multipart
+starlette
+
+# ── Data Validation ────────────────────────────────────────────────────────────
+pydantic
+pydantic-settings
+
+# ── MLflow Experiment Tracking ─────────────────────────────────────────────────
+mlflow
+boto3
+
+# ── Visualization ──────────────────────────────────────────────────────────────
+matplotlib
+seaborn
+plotly
+kaleido
+
+# ── Federated Learning (Module 12) ────────────────────────────────────────────
+flwr
+
+# ── Parallelism & Performance (Phase 3 Monte Carlo) ───────────────────────────
+joblib
+multiprocess
+psutil
+
+# ── Data I/O & Serialization ───────────────────────────────────────────────────
+pyarrow
+fastparquet
+h5py
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+python-dotenv
+structlog
+rich
+tqdm
+click
+tenacity
+cachetools
+
+# ── Testing ────────────────────────────────────────────────────────────────────
+pytest
+pytest-asyncio
+pytest-cov
+pytest-mock
+factory-boy
+
+# ── Notebooks & Dev Tools ──────────────────────────────────────────────────────
+jupyter
+ipykernel
+ipywidgets
+nbformat

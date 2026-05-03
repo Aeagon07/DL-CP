@@ -1,0 +1,555 @@
+# Phase 3 — Monte Carlo What-If Simulation Engine
+
+## Overview
+
+Phase 3 adds a **parallelized discrete-event simulation layer** on top of the Phases 1 & 2 ML predictions. Where Phase 2 answers *"what will happen?"*, Phase 3 answers **"what happens if we change X?"** — quantifying operational risk under uncertainty through 1,000-run Monte Carlo simulations.
+
+The engine models real Appian queue dynamics (Poisson arrivals, stochastic service times, agent capacity) using **SimPy**, drives parameters from Phase 2's LSTM/TFT forecasts and XGBoost breach probabilities, and produces statistically rigorous P10/P50/P90 risk distributions with full HTML reports.
+
+---
+
+## Architecture
+
+```
+Phase 2 ML Predictions
+  └── LSTMInference (volume forecast + MC Dropout CI)
+  └── XGBoostClassifier (breach probability)
+  └── TFT Forecaster (quantile q10/q50/q90)
+          │
+          ▼
+phase3_simulation/
+  ├── simpy_engine.py        ← Core discrete-event queue simulator
+  ├── monte_carlo.py         ← 1,000-run parallelised orchestrator
+  ├── scenario_builder.py    ← What-if scenario configurator
+  ├── risk_aggregator.py     ← P10/P50/P90 + tail risk statistics
+  └── report_generator.py    ← HTML + JSON risk report with CI bands
+          │
+          ▼
+outputs/
+  ├── simulation_results/    ← Per-run JSON outputs
+  └── reports/               ← Final HTML risk reports
+```
+
+---
+
+## File-by-File Design
+
+---
+
+### `phase3_simulation/__init__.py` [NEW]
+
+Simple package init exposing the top-level API: `MonteCarloEngine`, `ScenarioBuilder`, `RiskAggregator`, `ReportGenerator`.
+
+---
+
+### `phase3_simulation/simpy_engine.py` [NEW — Core DES Engine]
+
+**Purpose**: Implements a SimPy discrete-event simulation of one Appian operational queue for a fixed time horizon.
+
+**Key Classes**:
+
+#### `QueueConfig` (dataclass)
+Stores per-queue simulation parameters sourced from `synthetic_generator.QUEUE_CONFIGS`:
+```python
+@dataclass
+class QueueConfig:
+    name: str
+    sla_hours: float          # SLA deadline from generator config
+    arrival_rate: float       # λ — cases/hour (from LSTM forecast or baseline)
+    service_rate: float       # μ — cases/hour per agent
+    num_agents: int           # current staffing level (scenario-modifiable)
+    complexity_mix: dict      # LOW/MEDIUM/HIGH fractions from COMPLEXITY_WEIGHTS
+    complexity_multipliers: dict  # from COMPLEXITY_MULTIPLIERS
+```
+
+#### `SimulationResult` (dataclass)
+Output of one simulation run:
+```python
+@dataclass
+class SimulationResult:
+    run_id: int
+    queue_name: str
+    scenario_name: str
+    sim_horizon_hours: float
+    total_arrivals: int
+    total_completed: int
+    total_breached: int
+    breach_rate: float          # breached / total_arrivals
+    avg_wait_time_hours: float
+    p95_wait_time_hours: float
+    peak_wip: int
+    utilization: float          # fraction of agent-time used
+    sla_compliance_rate: float  # 1 - breach_rate
+    throughput_per_hour: float
+```
+
+#### `QueueSimulation`
+Core SimPy simulation class:
+
+```python
+class QueueSimulation:
+    def __init__(self, config: QueueConfig, seed: int, horizon_hours: float = 8.0):
+        ...
+
+    def run(self) -> SimulationResult:
+        env = simpy.Environment()
+        agents = simpy.Resource(env, capacity=self.config.num_agents)
+        env.process(self._arrival_process(env, agents))
+        env.run(until=self.config.horizon_hours * 3600)
+        return self._collect_results()
+
+    def _arrival_process(self, env, agents):
+        """Poisson arrival process. Each arrival triggers _case_process."""
+        while True:
+            inter_arrival = random.expovariate(self.config.arrival_rate / 3600)
+            yield env.timeout(inter_arrival)
+            env.process(self._case_process(env, agents))
+
+    def _case_process(self, env, agents):
+        """Service + SLA breach check per case."""
+        arrive_time = env.now
+        complexity = self._sample_complexity()
+        sla_deadline = arrive_time + self.config.sla_hours * 3600
+        with agents.request() as req:
+            yield req
+            # Lognormal service time (from generator's lognormal model)
+            service_time = random.lognormvariate(
+                math.log(30 * self.config.complexity_multipliers[complexity]),
+                sigma=0.5
+            ) * 60   # convert to seconds
+            yield env.timeout(service_time)
+        # Check breach
+        if env.now > sla_deadline:
+            self._breached += 1
+```
+
+**Key design decisions**:
+- Uses `simpy.Resource` for agent capacity (blocking queue)
+- Poisson arrivals with `expovariate` inter-arrival times
+- Lognormal service times matching the generator's distribution
+- Tracks arrival time, wait start, service start, completion time per case
+- Seeds are per-run for full reproducibility
+
+---
+
+### `phase3_simulation/monte_carlo.py` [NEW — Parallel MC Orchestrator]
+
+**Purpose**: Runs N parallel simulation replications (default 1,000) using `joblib` multiprocessing, aggregates raw results.
+
+#### `MonteCarloConfig` (dataclass)
+```python
+@dataclass
+class MonteCarloConfig:
+    n_runs: int = 1000
+    horizon_hours: float = 8.0   # simulation horizon per run
+    n_jobs: int = -1              # joblib: -1 = all CPU cores
+    base_seed: int = 42
+    use_ml_params: bool = True   # if True, drive arrival_rate from LSTM forecast
+```
+
+#### `MonteCarloEngine`
+```python
+class MonteCarloEngine:
+    def __init__(self, config: MonteCarloConfig, ml_forecasts: dict | None = None):
+        ...
+
+    def run_scenario(
+        self,
+        scenario: "Scenario",           # from scenario_builder.py
+        queue_configs: dict[str, QueueConfig],
+    ) -> list[SimulationResult]:
+        """
+        Parallelise N runs via joblib.Parallel.
+        Each run gets unique seed = base_seed + run_id.
+        Returns list of N SimulationResult objects.
+        """
+        results = Parallel(n_jobs=self.config.n_jobs)(
+            delayed(self._single_run)(scenario, queue_configs, run_id)
+            for run_id in range(self.config.n_runs)
+        )
+        return results
+
+    def _single_run(self, scenario, queue_configs, run_id) -> SimulationResult:
+        """One isolated simulation run. No shared state."""
+        # Apply scenario overrides to queue config
+        modified_config = scenario.apply(queue_configs)
+        sim = QueueSimulation(modified_config, seed=self.config.base_seed + run_id,
+                              horizon_hours=self.config.horizon_hours)
+        return sim.run()
+
+    def run_all_scenarios(self, scenarios, queue_configs) -> dict[str, list[SimulationResult]]:
+        """Run all scenarios. Returns scenario_name → results mapping."""
+        return {s.name: self.run_scenario(s, queue_configs) for s in scenarios}
+```
+
+**ML Parameter Integration**:
+When `use_ml_params=True`, the engine reads from `ml_forecasts` dict (output of `LSTMInference.predict()`) to set `arrival_rate` for each queue, replacing the static baseline. This means simulation parameters are **data-driven** from actual LSTM volume forecasts.
+
+---
+
+### `phase3_simulation/scenario_builder.py` [NEW — What-If Configurator]
+
+**Purpose**: Defines what-if scenarios by specifying modifications to queue configurations.
+
+#### `ScenarioParameter` (Enum)
+```python
+class ScenarioParameter(str, Enum):
+    AGENT_COUNT      = "num_agents"        # staffing change
+    ARRIVAL_RATE     = "arrival_rate"      # volume spike/drop
+    SLA_HOURS        = "sla_hours"         # SLA tightening/relaxing
+    SERVICE_RATE     = "service_rate"      # efficiency change
+    COMPLEXITY_MIX   = "complexity_mix"   # shift to more HIGH complexity
+```
+
+#### `ScenarioModification` (dataclass)
+```python
+@dataclass
+class ScenarioModification:
+    queue_name: str          # "Payment Processing" or "ALL"
+    parameter: ScenarioParameter
+    mode: Literal["absolute", "delta", "multiplier"]
+    value: float | dict      # e.g., -2 agents (delta), 1.5x arrival rate (multiplier)
+```
+
+#### `Scenario` (dataclass)
+```python
+@dataclass
+class Scenario:
+    name: str
+    description: str
+    modifications: list[ScenarioModification]
+
+    def apply(self, base_configs: dict[str, QueueConfig]) -> dict[str, QueueConfig]:
+        """Returns modified copy of queue configs with all mods applied."""
+```
+
+#### `ScenarioBuilder`
+Factory class with **pre-built scenario library**:
+
+| Scenario | What it tests |
+|---|---|
+| `baseline` | No changes — current staffing + volume |
+| `agent_reduction_2` | Remove 2 agents from Payment Processing |
+| `agent_reduction_all` | Remove 1 agent from every queue |
+| `volume_spike_20pct` | 20% arrival rate increase across all queues |
+| `volume_spike_50pct` | 50% arrival rate (Black Friday / quarter end) |
+| `sla_tighten_compliance` | Compliance Check SLA: 4h → 2h |
+| `sla_tighten_payment` | Payment Processing SLA: 2h → 1h |
+| `agent_add_2_payment` | Add 2 agents to Payment Processing |
+| `high_complexity_surge` | Shift complexity mix: 25% HIGH → 50% HIGH |
+| `combined_worst_case` | Volume spike 30% + agent reduction 1 + SLA tightened |
+
+```python
+class ScenarioBuilder:
+    @staticmethod
+    def get_all_scenarios() -> list[Scenario]: ...
+
+    @staticmethod
+    def from_dict(spec: dict) -> Scenario: ...   # custom user scenario
+
+    @staticmethod
+    def baseline_configs() -> dict[str, QueueConfig]:
+        """Build QueueConfig objects from QUEUE_CONFIGS in synthetic_generator."""
+```
+
+---
+
+### `phase3_simulation/risk_aggregator.py` [NEW — Statistical Risk Analysis]
+
+**Purpose**: Aggregates N simulation run results into P10/P50/P90 risk distributions and computes tail risk metrics.
+
+#### `RiskDistribution` (dataclass)
+```python
+@dataclass
+class RiskDistribution:
+    queue_name: str
+    scenario_name: str
+    metric: str                 # "breach_rate", "wait_time_p95", "utilization", etc.
+    n_runs: int
+    mean: float
+    std: float
+    p10: float
+    p50: float
+    p90: float
+    p95: float
+    p99: float
+    min_val: float
+    max_val: float
+    confidence_interval_95: tuple[float, float]   # (lower, upper) for mean
+```
+
+#### `ScenarioComparison` (dataclass)
+```python
+@dataclass
+class ScenarioComparison:
+    baseline_scenario: str
+    comparison_scenario: str
+    queue_name: str
+    metric: str
+    baseline_p50: float
+    comparison_p50: float
+    delta_absolute: float          # comparison_p50 - baseline_p50
+    delta_relative_pct: float      # percentage change
+    statistical_significance: bool  # Mann-Whitney U test p < 0.05
+    p_value: float
+    risk_verdict: str              # "BETTER" | "WORSE" | "NEUTRAL"
+```
+
+#### `RiskAggregator`
+```python
+class RiskAggregator:
+    def compute_distributions(
+        self,
+        results: list[SimulationResult],
+        scenario_name: str,
+    ) -> list[RiskDistribution]:
+        """
+        Computes RiskDistribution for each (queue, metric) pair.
+        Metrics: breach_rate, avg_wait_time_hours, p95_wait_time_hours,
+                 utilization, peak_wip, throughput_per_hour, sla_compliance_rate
+        """
+
+    def compare_scenarios(
+        self,
+        baseline_results: list[SimulationResult],
+        comparison_results: list[SimulationResult],
+        baseline_name: str,
+        comparison_name: str,
+    ) -> list[ScenarioComparison]:
+        """
+        Mann-Whitney U test (non-parametric) for statistical significance.
+        More robust than t-test for simulation outputs.
+        Uses scipy.stats.mannwhitneyu.
+        """
+
+    def compute_value_at_risk(
+        self,
+        results: list[SimulationResult],
+        confidence: float = 0.95,
+    ) -> dict[str, float]:
+        """VaR-style metric: worst breach_rate at confidence level per queue."""
+
+    def tail_risk_summary(
+        self,
+        results: list[SimulationResult],
+    ) -> dict:
+        """
+        Returns:
+          - worst_case_breach_rate (p99 across all queues)
+          - expected_breach_rate (mean across all runs, all queues)
+          - queues_at_risk: list of queues with p90_breach_rate > 0.15
+          - recommendations: auto-generated text list
+        """
+```
+
+---
+
+### `phase3_simulation/report_generator.py` [NEW — HTML Risk Reports]
+
+**Purpose**: Generates professional HTML + JSON risk reports with embedded Matplotlib charts, confidence interval bands, and narrative recommendations.
+
+#### `ReportConfig` (dataclass)
+```python
+@dataclass
+class ReportConfig:
+    output_dir: str = "outputs/reports"
+    include_charts: bool = True
+    chart_format: str = "png"   # embedded base64 in HTML
+    include_json: bool = True
+    top_n_scenarios: int = 5    # highlight top N riskiest scenarios
+```
+
+#### `ReportGenerator`
+```python
+class ReportGenerator:
+    def generate_html_report(
+        self,
+        scenario_results: dict[str, list[SimulationResult]],
+        distributions: dict[str, list[RiskDistribution]],
+        comparisons: list[ScenarioComparison],
+        config: ReportConfig,
+    ) -> str:
+        """
+        Generates a standalone HTML report with:
+          - Executive summary table (scenario × metric P50 values)
+          - Per-queue breach rate violin plots (P10/P50/P90 overlaid)
+          - Wait time distribution histograms
+          - Scenario comparison bar chart (delta vs baseline)
+          - Tail risk heatmap (queue × scenario, colour-coded)
+          - Narrative recommendations section
+          - Saved to output_dir/risk_report_{timestamp}.html
+        """
+
+    def generate_json_export(
+        self,
+        distributions: dict[str, list[RiskDistribution]],
+        comparisons: list[ScenarioComparison],
+    ) -> dict:
+        """Machine-readable JSON for Phase 5 API consumption."""
+
+    def _make_breach_violin_chart(self, distributions) -> str:
+        """Returns base64-encoded PNG for embedding in HTML."""
+
+    def _make_scenario_delta_chart(self, comparisons) -> str:
+        """Bar chart: delta breach rate vs baseline per scenario."""
+
+    def _make_tail_risk_heatmap(self, distributions) -> str:
+        """Seaborn heatmap: queue × scenario, coloured by P90 breach rate."""
+
+    def _generate_narrative(self, tail_risk: dict, comparisons: list) -> list[str]:
+        """
+        Auto-generates human-readable risk statements like:
+          'Removing 2 agents from Payment Processing increases breach risk
+           by +18.3pp (from 12.1% to 30.4% at P50) — STATISTICALLY SIGNIFICANT.'
+        """
+```
+
+#### Embedded Charts (all generated with Matplotlib/Seaborn, base64-encoded)
+1. **Breach Rate Violin Plot** — Per queue, per scenario: violin shows full distribution; dots mark P10/P50/P90
+2. **Wait Time CDF** — Cumulative distribution of wait times per scenario
+3. **Scenario Delta Bar Chart** — Change in P50 breach rate vs baseline; red = worse, green = better
+4. **Tail Risk Heatmap** — Queue × scenario matrix coloured by P90 breach rate
+5. **Throughput Box Plot** — Cases completed per hour across scenarios
+
+---
+
+### `phase3_simulation/runner.py` [NEW — Standalone Entry Point]
+
+**Purpose**: CLI entry point to run full Phase 3 simulations without requiring Kafka/Redis.
+
+```python
+"""
+Usage:
+  python -m phase3_simulation.runner --scenario all --runs 1000 --horizon 8
+  python -m phase3_simulation.runner --scenario agent_reduction_2 --runs 500
+  python -m phase3_simulation.runner --use-ml-params --model-dir models/
+"""
+```
+
+**Flow**:
+1. Parses CLI args (scenario, runs, horizon, use-ml-params, output-dir)
+2. Optionally loads LSTM checkpoints from `models/` to drive arrival rates
+3. Instantiates `ScenarioBuilder` → get scenarios
+4. Instantiates `MonteCarloEngine` → `run_all_scenarios()`
+5. Instantiates `RiskAggregator` → `compute_distributions()` + `compare_scenarios()`
+6. Instantiates `ReportGenerator` → `generate_html_report()` + `generate_json_export()`
+7. Prints summary table to terminal + saves report to `outputs/reports/`
+
+---
+
+## Dependencies
+
+All already in `requirements.txt` except `simpy`:
+
+| Package | Use | Already Installed? |
+|---|---|---|
+| `simpy` | Discrete-event simulation | ❌ Must add |
+| `joblib` | Parallel simulation runs | ✅ (sklearn dep) |
+| `scipy` | Mann-Whitney U test | ✅ |
+| `matplotlib` | Chart generation | ✅ |
+| `seaborn` | Heatmap | ✅ |
+| `numpy` | Statistics | ✅ |
+| `pandas` | Result aggregation | ✅ |
+
+> [!IMPORTANT]
+> `simpy` must be added to `requirements.txt`. Current version: `simpy>=4.1.1`
+
+---
+
+## Integration with Phase 2
+
+Phase 2 outputs feed Phase 3 in two ways:
+
+| Phase 2 Output | Phase 3 Usage |
+|---|---|
+| `LSTMInference.predict()` → `mean['1h']` | Sets `arrival_rate` in `QueueConfig` (ML-driven simulation) |
+| `XGBoostClassifier` breach probability | Overlaid on simulation breach rate for cross-validation |
+| `TFTForecaster` q10/q90 quantiles | Used as P10/P90 bounds for arrival rate uncertainty |
+| `DriftMonitor` PSI score | If PSI > 0.2, simulation uses widened arrival rate variance |
+
+---
+
+## Output Examples
+
+### Terminal Summary
+```
+═══════════════════════════════════════════════════════════
+  MONTE CARLO SIMULATION RESULTS (1,000 runs, 8h horizon)
+═══════════════════════════════════════════════════════════
+Scenario                    P10       P50       P90    vs Baseline
+baseline                   8.2%     12.1%     19.4%        —
+agent_reduction_2          14.3%    30.4%     51.2%    +18.3pp ⚠️
+volume_spike_50pct         18.1%    34.7%     59.3%    +22.6pp 🔴
+sla_tighten_payment        22.4%    41.2%     67.8%    +29.1pp 🔴
+agent_add_2_payment         5.1%     8.3%     13.9%     -3.8pp ✅
+combined_worst_case        35.2%    58.1%     81.3%    +46.0pp 🔴
+```
+
+### JSON Export (for Phase 5 API)
+```json
+{
+  "simulation_id": "sim_20260430_143000",
+  "n_runs": 1000,
+  "scenarios": {
+    "baseline": {
+      "Payment Processing": {
+        "breach_rate": {"p10": 0.082, "p50": 0.121, "p90": 0.194},
+        "wait_time_p95_hours": {"p10": 1.2, "p50": 1.8, "p90": 2.9}
+      }
+    }
+  }
+}
+```
+
+---
+
+## Verification Plan
+
+### Automated Tests
+- `python -m phase3_simulation.runner --scenario baseline --runs 100 --horizon 4` — Smoke test
+- Verify `SimulationResult` fields are non-null and in valid ranges
+- Verify Mann-Whitney U p-values are meaningful (agent_reduction should be < 0.05 vs baseline)
+- Verify HTML report is generated and non-empty
+- Verify JSON export is valid and parseable
+
+### Statistical Sanity Checks
+- Baseline breach rate should be in range [5%, 25%] for Payment Processing (matches empirical)
+- `agent_reduction_2` P50 breach rate must be > `baseline` P50 (monotonicity)
+- `agent_add_2_payment` P50 breach rate must be < `baseline` P50
+
+### Manual Verification
+- Open HTML report in browser and confirm all 5 charts render correctly
+- Confirm narrative text is generated for worst-case scenarios
+
+---
+
+## Open Questions for Review
+
+> [!IMPORTANT]
+> **Q1: Number of simulation runs** — Default is 1,000 runs. On your machine (Windows, no GPU needed for SimPy), 1,000 × 6 queues takes ~30–90 seconds with `joblib`. Would you prefer a `--fast` mode (100 runs) for quick iteration?
+
+> [!IMPORTANT]
+> **Q2: Simulation horizon** — Default is 8 hours (one business day segment). Should we also support 24h and weekly horizons for longer-term planning scenarios?
+
+> [!NOTE]
+> **Q3: ML parameter integration** — The full ML-driven mode requires trained LSTM checkpoints in `models/`. Since we haven't trained the models with real data yet, should the `runner.py` default to `--use-ml-params=False` (pure SimPy with generator baseline configs) to make Phase 3 runnable independently?
+
+> [!NOTE]
+> **Q4: Additional scenarios** — I've planned 10 built-in scenarios. Are there specific Appian operational scenarios you'd like included (e.g., "weekend skeleton crew", "regulatory audit mode", "new queue onboarding")?
+
+---
+
+## Estimated Effort
+
+| File | Complexity | Lines (est.) |
+|---|---|---|
+| `simpy_engine.py` | High | ~350 |
+| `monte_carlo.py` | Medium | ~250 |
+| `scenario_builder.py` | Medium | ~300 |
+| `risk_aggregator.py` | High | ~350 |
+| `report_generator.py` | High | ~450 |
+| `runner.py` | Low | ~150 |
+| `__init__.py` | Low | ~30 |
+| **Total** | | **~1,880 lines** |
+
+**Estimated implementation time**: 2–3 focused sessions.

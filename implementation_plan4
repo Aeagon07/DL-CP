@@ -1,0 +1,359 @@
+# Phase 4 — Reinforcement Learning Auto-Optimizer
+
+## Overview
+
+Phase 4 adds a **prescriptive AI layer** on top of Phases 1–3. Where Phase 2 answers *"what will happen?"* and Phase 3 answers *"what happens if X changes?"*, Phase 4 answers **"what should we do right now?"**
+
+A PPO (Proximal Policy Optimization) agent learns to **reallocate agents across queues** to minimize SLA breaches and maximize throughput — fully without Kafka/Redis for standalone training, with an optional inference module that writes recommendations to the FeatureStore.
+
+---
+
+## How It Integrates with Previous Phases
+
+```
+Phase 1 (Kafka Features)
+        ↓
+Phase 2 (LSTM / XGBoost breach predictions)
+        ↓
+Phase 3 (SimPy simulation → breach rates per scenario)   ← RL trains IN THIS environment
+        ↓
+Phase 4 (PPO agent → optimal agent reallocation actions)
+        ↓
+FeatureStore (rl:recommendations:latest) → Phase 5 Dashboard
+```
+
+The RL environment wraps the Phase 3 `QueueSimulation` engine: **each RL step = one simulated 8-hour shift**. The agent observes queue states and chooses how to move agents; the simulator returns the resulting breach rate as the reward signal.
+
+---
+
+## File Plan — 7 Files
+
+| File | Lines (est.) | Role |
+|---|---|---|
+| `phase4_rl/__init__.py` | ~40 | Public API exports |
+| `phase4_rl/action_space.py` | ~120 | Action encoding / decoding + masking |
+| `phase4_rl/reward_shaper.py` | ~150 | Multi-objective reward function |
+| `phase4_rl/queue_env.py` | ~350 | Custom Gymnasium environment (core) |
+| `phase4_rl/curriculum_env.py` | ~200 | Progressive difficulty curriculum wrapper |
+| `phase4_rl/ppo_agent.py` | ~280 | Training orchestrator (stable-baselines3 PPO) |
+| `phase4_rl/rl_inference.py` | ~200 | Standalone inference + FeatureStore writer |
+| `phase4_rl/runner.py` | ~150 | CLI entry point (train + eval + infer) |
+
+**Total: ~1,490 lines across 8 files**
+
+---
+
+## Proposed Changes
+
+### `phase4_rl/__init__.py` [NEW]
+
+Public API:
+```python
+from phase4_rl import AppianQueueEnv, CurriculumEnv, PPOTrainer, RLInferenceEngine
+from phase4_rl.action_space import ActionSpace
+from phase4_rl.reward_shaper import RewardShaper
+```
+
+---
+
+### `phase4_rl/action_space.py` [NEW]
+
+**Design goal:** Encode "move N agents from queue A to queue B" as a flat integer action.
+
+```
+Total queues: 6
+Transfer amounts: −2, −1, 0, +1, +2 per queue (relative to baseline)
+Approach: MultiDiscrete([5, 5, 5, 5, 5, 5]) → 6 queues × 5 delta levels
+```
+
+Key class:
+```python
+class ActionSpace:
+    N_QUEUES    = 6
+    DELTAS      = [-2, -1, 0, +1, +2]   # agents to add/remove per queue
+
+    def decode(action: np.ndarray) -> Dict[str, int]:
+        """Map MultiDiscrete action → {queue_name: agent_delta}"""
+
+    def apply(action, current_agents) -> Dict[str, int]:
+        """Apply deltas, clamp to [min_agents, max_agents] per queue"""
+
+    def is_valid(action, current_agents) -> bool:
+        """Check budget constraint: total agents stays within ±3 of baseline"""
+
+    def get_action_mask(current_agents) -> np.ndarray:
+        """Returns boolean mask for invalid actions (at min/max capacity)"""
+```
+
+**Budget constraint:** Total agents across all queues cannot increase/decrease by more than 3 in one step (prevents degenerate policies).
+
+---
+
+### `phase4_rl/reward_shaper.py` [NEW]
+
+**Multi-objective reward function — the most critical design decision:**
+
+```
+R = -w1 × breach_rate         (primary: minimize SLA breaches)
+  + w2 × throughput_norm      (secondary: maximize cases completed)
+  - w3 × utilization_penalty  (tertiary: avoid agent burnout >95%)
+  - w4 × action_magnitude     (regularization: penalize extreme moves)
+  + w5 × sla_compliance_bonus (bonus: reward staying >90% compliant)
+```
+
+Default weights: `w1=5.0, w2=1.0, w3=0.5, w4=0.2, w5=2.0`
+
+Key class:
+```python
+class RewardShaper:
+    def compute(
+        sim_result: List[SimulationResult],   # from Phase 3 engine
+        action: np.ndarray,
+        prev_breach_rate: float,
+    ) -> Tuple[float, dict]:                  # (reward, info_dict)
+
+    def episode_summary(rewards: List[float]) -> dict:
+        """Returns mean, std, min, max reward + breach trajectory"""
+```
+
+**Shaped reward extras:**
+- **Improvement bonus:** +1.0 if breach rate improved vs previous step
+- **Crash penalty:** −5.0 if any queue breaches >80% of cases in a step
+
+---
+
+### `phase4_rl/queue_env.py` [NEW] ⭐ Core File
+
+Custom **Gymnasium** environment wrapping the Phase 3 SimPy simulator.
+
+```python
+class AppianQueueEnv(gymnasium.Env):
+    metadata = {"render_modes": ["human", "rgb_array", "ansi"]}
+
+    # ── Spaces ───────────────────────────────────────────────
+    # Observation: 6 queues × 8 features = 48-dim float32 Box
+    # Features per queue: [wip, utilization, breach_rate, avg_wait,
+    #                      arrival_rate, num_agents, sla_hours, throughput]
+    observation_space: Box(shape=(48,), dtype=np.float32)
+
+    # Action: MultiDiscrete — one delta level per queue
+    action_space: MultiDiscrete([5, 5, 5, 5, 5, 5])
+```
+
+**Episode structure:**
+- `reset()` → randomize arrival rates ±20% (adds stochasticity for generalization)
+- `step(action)`:
+  1. Decode action → agent deltas
+  2. Apply deltas to QueueConfig objects
+  3. Run one `QueueSimulation` (8h horizon, 10 sim-runs averaged for stability)
+  4. Compute reward via `RewardShaper`
+  5. Return `(obs, reward, terminated, truncated, info)`
+- `terminated = True` after `max_steps` steps (default: 20 steps = 1 training episode)
+- `render(mode="ansi")` → pretty-print queue states to terminal
+
+**Observation normalization:** All features min-max normalized using constants derived from Phase 3 baseline runs to keep inputs in [0, 1].
+
+**Seeding:** `env.reset(seed=42)` → fully reproducible episodes.
+
+---
+
+### `phase4_rl/curriculum_env.py` [NEW]
+
+Progressive difficulty wrapper — mirrors Phase 2's `curriculum_learning.py` design pattern.
+
+```
+Phase 1 (Easy):    baseline arrival rates, 20 steps/episode
+Phase 2 (Medium):  ±20% arrival rate noise, 15 steps/episode, faster SLA deadlines
+Phase 3 (Hard):    volume spikes (up to ×1.5), agent failures (random −1 agent mid-episode)
+```
+
+```python
+class CurriculumEnv(gymnasium.Wrapper):
+    """
+    Wraps AppianQueueEnv and advances difficulty when agent
+    achieves mean_reward > threshold over last 50 episodes.
+    """
+    def __init__(self, base_env, thresholds=[-5.0, -2.0, 0.0]):
+        ...
+
+    @property
+    def current_phase(self) -> int: ...
+
+    def step(self, action):
+        obs, reward, term, trunc, info = self.env.step(action)
+        self._maybe_advance_phase(reward)
+        return obs, reward, term, trunc, info
+```
+
+---
+
+### `phase4_rl/ppo_agent.py` [NEW]
+
+Training orchestrator using **stable-baselines3 PPO**.
+
+```python
+@dataclass
+class PPOConfig:
+    total_timesteps:  int   = 200_000
+    learning_rate:    float = 3e-4
+    n_steps:          int   = 2048
+    batch_size:       int   = 64
+    n_epochs:         int   = 10
+    gamma:            float = 0.99
+    clip_range:       float = 0.2
+    ent_coef:         float = 0.01      # entropy bonus for exploration
+    use_curriculum:   bool  = True
+    checkpoint_dir:   str   = "phase4_rl/checkpoints"
+    log_dir:          str   = "phase4_rl/logs"
+
+
+class PPOTrainer:
+    def train(self) -> PPO:
+        """Full training loop with curriculum, checkpointing, MLflow logging."""
+
+    def evaluate(self, model, n_episodes=20) -> dict:
+        """Run N evaluation episodes; return mean/std reward + breach metrics."""
+
+    def save(self, model, path): ...
+    def load(self, path) -> PPO: ...
+```
+
+**MLflow integration:** Logs all hyperparameters + episode reward curves to the existing `mlflow_tracking.py` pattern established in Phase 2.
+
+**Checkpointing:** Saves best model by mean eval reward every 10k steps.
+
+---
+
+### `phase4_rl/rl_inference.py` [NEW]
+
+Standalone inference engine — no Kafka required; optional Redis write.
+
+```python
+class RLInferenceEngine:
+    """
+    Loads a trained PPO model and generates staffing recommendations
+    from current queue state observations.
+    """
+
+    def __init__(self, model_path: str, use_feature_store: bool = False):
+        self._model = PPO.load(model_path)
+        self._store = FeatureStore() if use_feature_store else None
+
+    def recommend(
+        self,
+        queue_states: Dict[str, dict],   # {queue_name: {wip, utilization, ...}}
+    ) -> RLRecommendation:               # dataclass with actions + confidence
+
+    def run_inference_loop(
+        self,
+        interval_seconds: int = 300,     # every 5 minutes
+    ): ...                               # infinite loop; Ctrl+C to stop
+```
+
+**`RLRecommendation` dataclass:**
+```python
+@dataclass
+class RLRecommendation:
+    timestamp: datetime
+    actions: Dict[str, int]          # {queue_name: agent_delta}
+    predicted_breach_reduction: float
+    confidence: float                # from action probability distribution
+    narrative: str                   # "Move +2 agents to Payment Processing..."
+```
+
+---
+
+### `phase4_rl/runner.py` [NEW]
+
+CLI entry point:
+
+```
+python -m phase4_rl.runner train
+python -m phase4_rl.runner train --timesteps 50000 --no-curriculum
+python -m phase4_rl.runner eval --model phase4_rl/checkpoints/best_model
+python -m phase4_rl.runner infer --model phase4_rl/checkpoints/best_model
+python -m phase4_rl.runner demo   # quick 10-episode demo, no model needed
+```
+
+---
+
+## Data Flow Diagram
+
+```
+AppianQueueEnv.reset()
+    → randomize QueueConfigs (±20% arrival noise)
+    → return obs (48-dim float32)
+
+AppianQueueEnv.step(action)
+    │
+    ├─ ActionSpace.decode(action)      → {queue: delta}
+    ├─ ActionSpace.apply(deltas)       → modified QueueConfigs
+    ├─ QueueSimulation.run() × 10     → List[SimulationResult]   [Phase 3]
+    ├─ RewardShaper.compute()         → (reward, info)
+    └─ return (obs, reward, done, info)
+
+PPO (stable-baselines3)
+    │
+    ├─ Collects n_steps=2048 transitions
+    ├─ Computes GAE advantage estimates
+    ├─ Updates policy + value network (10 epochs)
+    └─ Checkpoints best model
+
+RLInferenceEngine
+    ├─ Loads trained PPO model
+    ├─ Gets queue states (synthetic / FeatureStore)
+    └─ Writes RLRecommendation → FeatureStore (rl:recommendations:latest)
+```
+
+---
+
+## Key Design Decisions
+
+| Decision | Choice | Reason |
+|---|---|---|
+| RL algorithm | PPO (stable-baselines3) | Battle-tested, works well on low-dimensional continuous control, easy to tune |
+| Sim runs per step | 10 averaged | Reduces stochasticity in reward signal; fast enough (~0.1s/step) |
+| Action space | MultiDiscrete([5]×6) | Simpler than full combinatorial; agent learns per-queue independently |
+| Observation space | 48-dim Box (6 queues × 8 features) | Compact; covers all operationally relevant state |
+| Budget constraint | Total agents ±3 from baseline | Prevents trivially overstaffing all queues |
+| Curriculum | 3-phase (easy→hard) | Prevents early convergence to suboptimal "do nothing" policy |
+| Training time | ~200k steps ≈ 5–10 min | Fast enough for local machine; visible progress |
+
+---
+
+## Verification Plan
+
+### Automated
+```bash
+# Smoke test (1000 steps, no curriculum)
+python -m phase4_rl.runner train --timesteps 1000 --no-curriculum
+
+# Evaluation (20 episodes)
+python -m phase4_rl.runner eval --model phase4_rl/checkpoints/best_model
+
+# Demo mode (no model needed)
+python -m phase4_rl.runner demo
+```
+
+### What "success" looks like:
+- ✅ Zero import/runtime errors
+- ✅ Training reward improves over episodes (not flat/diverging)
+- ✅ Eval mean breach rate < baseline (agent is actually helping)
+- ✅ `RLRecommendation` narrative is human-readable and non-trivial
+- ✅ MLflow experiment logged with reward curves
+
+---
+
+## Open Questions for Review
+
+> [!IMPORTANT]
+> **Q1 — Training speed vs quality:** The default is 200,000 timesteps. With 10 sim-runs averaged per step, training takes ~5–10 min on a modern CPU. Should I reduce to 50k steps for a faster demo, or keep 200k for better policy quality?
+
+> [!IMPORTANT]
+> **Q2 — Action space granularity:** The plan uses `MultiDiscrete([5]×6)` (±2 agents per queue). Should I add larger deltas like ±3 or ±5 for more aggressive reallocation, or keep ±2 as conservative?
+
+> [!NOTE]
+> **Q3 — MLflow:** Should Phase 4 log to the same MLflow experiment as Phase 2, or create a separate `phase4_rl` experiment?
+
+> [!NOTE]
+> **Q4 — Inference loop:** The `rl_inference.py` has an optional Redis-based loop. Since Docker isn't running, should I keep this as a purely standalone "batch infer" mode (no Redis required) as the default?
